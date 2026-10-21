@@ -426,11 +426,12 @@ def get_data(
 			if kc.get("delete"):
 				column_data = []
 			else:
-				page_length = kc.get("page_length", 20)
+				# don't shadow the top-level page_length echoed in the response
+				column_page_length = kc.get("page_length", 20)
 
 				if order:
 					column_data = get_records_based_on_order(
-						doctype, rows, column_filters, page_length, order
+						doctype, rows, column_filters, column_page_length, order
 					)
 				else:
 					column_data = frappe.get_list(
@@ -438,7 +439,7 @@ def get_data(
 						fields=rows,
 						filters=column_filters,
 						order_by=order_by,
-						page_length=page_length,
+						page_length=column_page_length,
 					)
 
 				all_count = frappe.get_list(
@@ -449,6 +450,8 @@ def get_data(
 
 				kc["all_count"] = all_count
 				kc["count"] = len(column_data)
+
+				set_activity_counts(column_data, doctype)
 
 			if order:
 				column_data = sorted(
@@ -659,37 +662,37 @@ def get_fields(doctype: str, allow_all_fieldtypes: bool = False):
 	return _fields
 
 
-def getCounts(d, doctype):
-	d["_email_count"] = (
-		frappe.db.count(
-			"Communication",
-			filters={
-				"reference_doctype": doctype,
-				"reference_name": d.get("name"),
-				"communication_type": "Communication",
-			},
+def set_activity_counts(rows, doctype):
+	# one grouped query per activity type instead of one query per card
+	names = [d.get("name") for d in rows]
+	if not names:
+		return rows
+
+	def count_by(activity_doctype, link_field, filters=None):
+		result = frappe.get_all(
+			activity_doctype,
+			filters={"reference_doctype": doctype, link_field: ["in", names], **(filters or {})},
+			fields=[link_field, COUNT_NAME],
+			group_by=link_field,
 		)
-		or 0
-	)
-	d["_email_count"] = d["_email_count"] + frappe.db.count(
+		return {r.get(link_field): r.total_count for r in result}
+
+	email_counts = count_by(
 		"Communication",
-		filters={
-			"reference_doctype": doctype,
-			"reference_name": d.get("name"),
-			"communication_type": "Automated Message",
-		},
+		"reference_name",
+		{"communication_type": ["in", ["Communication", "Automated Message"]]},
 	)
-	d["_comment_count"] = frappe.db.count(
-		"Comment",
-		filters={"reference_doctype": doctype, "reference_name": d.get("name"), "comment_type": "Comment"},
-	)
-	d["_task_count"] = frappe.db.count(
-		"CRM Task", filters={"reference_doctype": doctype, "reference_docname": d.get("name")}
-	)
-	d["_note_count"] = frappe.db.count(
-		"FCRM Note", filters={"reference_doctype": doctype, "reference_docname": d.get("name")}
-	)
-	return d
+	comment_counts = count_by("Comment", "reference_name", {"comment_type": "Comment"})
+	task_counts = count_by("CRM Task", "reference_docname")
+	note_counts = count_by("FCRM Note", "reference_docname")
+
+	for d in rows:
+		name = d.get("name")
+		d["_email_count"] = email_counts.get(name, 0)
+		d["_comment_count"] = comment_counts.get(name, 0)
+		d["_task_count"] = task_counts.get(name, 0)
+		d["_note_count"] = note_counts.get(name, 0)
+	return rows
 
 
 @frappe.whitelist()
@@ -769,6 +772,9 @@ def remove_doc_link(doctype, docname):
 
 
 def remove_contact_link(doctype, docname):
+	# crm.api.whatsapp imports this module at load time
+	from crm.api.whatsapp import WhatsAppRecipientChangeError
+
 	if not doctype or not docname:
 		return
 
@@ -781,12 +787,17 @@ def remove_contact_link(doctype, docname):
 			}
 		)
 		linked_doc_data.save(ignore_permissions=True)
+	except WhatsAppRecipientChangeError:
+		raise
 	except (frappe.DoesNotExistError, frappe.ValidationError):
 		pass
 
 
 @frappe.whitelist()
 def remove_linked_doc_reference(items: str | list, remove_contact: bool = False, delete: bool = False):
+	# crm.api.whatsapp imports this module at load time
+	from crm.api.whatsapp import WhatsAppRecipientChangeError
+
 	if isinstance(items, str):
 		items = frappe.parse_json(items)
 
@@ -805,6 +816,8 @@ def remove_linked_doc_reference(items: str | list, remove_contact: bool = False,
 
 			if delete:
 				frappe.delete_doc(item["doctype"], item["docname"])
+		except WhatsAppRecipientChangeError:
+			raise
 		except (frappe.DoesNotExistError, frappe.ValidationError):
 			# Skip if document doesn't exist or has validation errors
 			continue
